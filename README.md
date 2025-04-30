@@ -13,7 +13,7 @@ This repository benchmarks the performance of machine learning interatomic poten
 | Q5 | Reference structures match three lowest-energy predicted structures in *exact relative energy order* |
 
 
-** Requirements
+## Requirements
 Install the following dependencies before running the benchmark:
 
 import torch
@@ -34,7 +34,7 @@ from pymatgen.analysis.structure_matcher import StructureMatcher
 from pymatgen.core import Structure
 from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 
-** Different calculators can be applied:
+## Different calculators can be applied:
 
 MACE: 
 from mace.calculators import mace_mp
