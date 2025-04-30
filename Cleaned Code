@@ -1,0 +1,163 @@
+# Benchmarking Script for Crystal Structure Prediction
+# Author: PeiShan Zhong
+
+import os
+import time
+import yaml
+import json
+import csv
+import torch
+import pandas as pd
+from pathlib import Path
+from ase.io import write
+from ase import Atoms
+from ase.optimize import BFGSLineSearch
+from ase.filters import FrechetCellFilter
+from pymatgen.io.ase import AseAtomsAdaptor
+from pymatgen.core import Structure
+from pymatgen.analysis.structure_matcher import StructureMatcher
+from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+from airsspy import SeedAtoms
+from mace.calculators import mace_mp
+from ipypb import ipb as tqdm
+
+# Device and calculator setup
+device = "cuda" if torch.cuda.is_available() else "cpu"
+calc = mace_mp(default_dtype="float64", device=device)
+
+# Optional: add AIRSS path if provided
+airss_path = os.environ.get("AIRSS_BIN")
+if airss_path:
+    os.environ["PATH"] += os.pathsep + airss_path
+
+# Define working directories
+base_dir = Path(__file__).resolve().parent / "Benchmark"
+data_path = base_dir / "data.yaml"
+
+with open(data_path) as f:
+    benchmark_input = yaml.safe_load(f)
+
+def get_formula_str(structure):
+    structure = structure.remove_oxidation_states()
+    composition = structure.composition.reduced_composition
+    el_amt = composition.get_el_amt_dict()
+    return ",".join(f"{el}%NUM={int(amt)}" for el, amt in el_amt.items())
+
+def volume_calculator(structure):
+    data = {"volume": structure.volume,
+            "natoms": len(structure),
+            "symm": structure.get_space_group_info()[0]}
+    formula_units = structure.composition.get_reduced_formula_and_factor()[1]
+    tarvol = data["volume"] / formula_units if formula_units else None
+    return {"volume": data["volume"], "target_volume": tarvol, "symmetry": data["symm"]}
+
+def define_seed(structure, symmops):
+    species = get_formula_str(structure)
+    targvol = volume_calculator(structure)["target_volume"]
+    seed = SeedAtoms()
+    seed.gentags.species = species
+    seed.gentags.nform = "1-4"
+    seed.gentags.symmops = symmops
+    seed.gentags.slack = 0.25
+    seed.gentags.overlap = 0.1
+    seed.gentags.compact = True
+    seed.gentags.targvol = targvol + 0.5
+    seed.gentags.minsep = 2.5
+    return seed
+
+def gen_and_relax(seed, calculator):
+    atoms = seed.build_random_atoms()
+    atoms.set_pbc(True)
+    atoms.calc = calculator
+    opt = BFGSLineSearch(FrechetCellFilter(atoms))
+    opt.run(fmax=0.05, steps=500)
+    return atoms
+
+def grouping(structures):
+    sm = StructureMatcher()
+    grouped = sm.group_structures(structures)
+    result = []
+    for group in grouped:
+        rep = group[0]
+        symm = SpacegroupAnalyzer(rep).get_space_group_symbol()
+        energies = [s.properties.get("energy") for s in group if "energy" in s.properties]
+        avg_energy = sum(energies) / len(energies) if energies else None
+        result.append({
+            "rep_structure": rep,
+            "space_group": symm,
+            "energy": avg_energy,
+            "multiplicity": len(group)
+        })
+    return sorted(result, key=lambda d: float('inf') if d["energy"] is None else d["energy"])
+
+def relaxation_analysis(seed, calculator, num_iterations):
+    relaxed_structures, ase_structures, properties = [], [], []
+    for i in tqdm(range(num_iterations)):
+        try:
+            ase = gen_and_relax(seed, calculator)
+        except Exception:
+            continue
+        ase_structures.append(ase)
+        struct = AseAtomsAdaptor.get_structure(ase)
+        struct.properties["energy"] = ase.get_potential_energy()
+        relaxed_structures.append(struct)
+        vol_data = volume_calculator(struct)
+        lat = struct.lattice
+        properties.append({
+            "structure_id": i,
+            "volume": vol_data["volume"],
+            "target_volume": vol_data["target_volume"],
+            "symmetry": vol_data["symmetry"],
+            "energy": ase.get_potential_energy(),
+            "fmax": ase.get_forces().max(),
+            "atomic_positions": struct.frac_coords.tolist(),
+            "lattice_a": lat.a, "lattice_b": lat.b, "lattice_c": lat.c,
+            "lattice_alpha": lat.alpha, "lattice_beta": lat.beta, "lattice_gamma": lat.gamma,
+        })
+    return properties, grouping(relaxed_structures), ase_structures
+
+def benchmark_calculator_structure(calculator, structure_1, structure_2, structure_3, num_iterations, symmops, output_folder):
+    start = time.time()
+    s1, s2, s3 = Structure.from_file(structure_1), Structure.from_file(structure_2), Structure.from_file(structure_3)
+    seed = define_seed(s1, symmops=symmops)
+    props, grouped, _ = relaxation_analysis(seed, calculator, num_iterations)
+    output_folder.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(props).to_csv(output_folder / "relaxed_properties.csv", index=False)
+    pd.DataFrame(grouped).to_csv(output_folder / "relaxed_grouped.csv", index=False)
+    top3 = grouped[:3]
+    pred_s1, pred_s2, pred_s3 = top3[0]["rep_structure"], top3[1]["rep_structure"], top3[2]["rep_structure"]
+    sm = StructureMatcher()
+    Q1 = any(sm.fit(s1, g["rep_structure"]) for g in grouped)
+    Q2 = any(sm.fit(s1, s) for s in [pred_s1, pred_s2, pred_s3])
+    Q3 = sm.fit(s1, pred_s1)
+    Q4 = all(any(sm.fit(ref, s) for s in [pred_s1, pred_s2, pred_s3]) for ref in [s1, s2, s3])
+    Q5 = all(sm.fit(r, p) for r, p in zip([s1, s2, s3], [pred_s1, pred_s2, pred_s3]))
+    return {
+        "Q1": int(Q1), "Q2": int(Q2), "Q3": int(Q3), "Q4": int(Q4), "Q5": int(Q5),
+        "time_taken": time.time() - start, "relaxed_grouped": grouped
+    }
+
+def calculate_statistics(results):
+    total = len(results.get("relaxed_grouped", []))
+    return {f"Q{i}_stats": results.get(f"Q{i}", 0) / total if total else 0 for i in range(1, 6)}
+
+def benchmark_calculator(calculator, calculator_name, num_iterations=1000, symmops="1-4", classes=("elemental", "binary", "ternary")):
+    all_results, all_stats = {}, {}
+    for class_name in classes:
+        for name, data in benchmark_input.get(class_name, {}).items():
+            folder = base_dir / data["folder"]
+            s1, s2, s3 = folder / "1.cif", folder / "2.cif", folder / "3.cif"
+            out = base_dir / calculator_name / name
+            result = benchmark_calculator_structure(calculator, s1, s2, s3, num_iterations, symmops, out)
+            all_results[name] = result
+            all_stats[name] = calculate_statistics(result)
+            pd.DataFrame.from_dict(all_stats, orient="index").to_csv(out / "all_stats.csv", index=False)
+            pd.DataFrame.from_dict(all_results, orient="index").to_csv(out / "all_results.csv", index=False)
+    return all_results, all_stats
+
+def main():
+    results, stats = benchmark_calculator(calc, "Mace", classes=["elemental", "binary", "ternary"])
+    print("Benchmarking complete.")
+
+if __name__ == "__main__":
+    main()
