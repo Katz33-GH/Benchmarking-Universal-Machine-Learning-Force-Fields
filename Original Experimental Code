@@ -1,0 +1,576 @@
+# This script benchmarks crystal structure prediction using machine learning calculators include MACE-MP-0, GRACE-1L-OAM, MatterSim v1 5M, SevenNet-0
+# for a range of compounds, evaluating structural match quality using Q1-Q5 metrics.
+# Author: PeiShan Zhong
+
+
+import yaml
+from airsspy import SeedAtoms, Buildcell
+from ipypb import ipb as tqdm
+import json
+from ase.io import write
+from ase.optimize import BFGSLineSearch, sciopt, FIRE, BFGS, precon
+from ase.constraints import UnitCellFilter, ExpCellFilter
+from ase.filters import FrechetCellFilter
+from ase import Atoms
+from pymatgen.io.ase import AseAtomsAdaptor
+
+
+from mace.calculators import mace_mp
+import pandas as pd
+import os
+import csv
+from pymatgen.analysis.structure_matcher import StructureMatcher
+from pymatgen.core import Structure
+from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+
+import torch
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+calc = mace_mp(default_dtype="float64", device=device)
+
+airss_path = os.environ.get("AIRSS_BIN", None)
+if airss_path:
+    os.environ["PATH"] += os.pathsep + airss_path
+    
+base_dir = Path(__file__).resolve().parent / "Benchmark"
+os.chdir(base_dir)
+
+data_path = base_dir / "data.yaml"
+with open(data_path) as f:
+    benchmark_input = yaml.safe_load(f)
+
+
+def get_formula_str(structure):
+
+    structure = structure.remove_oxidation_states()
+    composition = structure.composition.reduced_composition
+    el_amt = composition.get_el_amt_dict()
+    return ",".join(f"{el}%NUM={int(amt)}" for el, amt in el_amt.items())
+
+def define_seed(
+    structure,
+    symmops,
+):
+    species = get_formula_str(structure)
+    targvol = volume_calculator(structure)["target_volume"]
+
+    seed = SeedAtoms()
+    seed.gentags.species = species
+    seed.gentags.nform = "1-4"  
+    seed.gentags.symmops = symmops
+    seed.gentags.slack = 0.25
+    seed.gentags.overlap = 0.1
+    seed.gentags.compact = True
+    seed.gentags.targvol = targvol+0.5
+    seed.gentags.minsep = 2.5
+
+    return seed
+
+
+
+class RESFile:
+    """
+    Class represent a res file
+
+    The SHELX file contains both the structure and the computed properties as
+    well as some metadata.
+    """
+
+    def __init__(self, structure, data, lines=None, metadata=None):
+        """
+        Initialise an RESFile object base on pymatgen.Structure.
+
+        The most cases it is best to initialise using class methods such as
+        `from_file` or `from_lines`.
+
+        :param structure: `pymatgen.Structure` instance
+        :param data: A dictionary contains the underlying data
+        :param lines: A list of raw lines of the RESFile
+
+        """
+        if isinstance(structure, Atoms):
+            structure = AseAtomsAdaptor.get_structure(structure)
+
+        self.structure = structure
+        self.lines = lines
+
+        if "volume" not in data:
+            data["volume"] = structure.volume if structure else None
+
+        if "natoms" not in data:
+            data["natoms"] = len(structure)
+
+        if "symm" not in data:
+            data["symm"] = structure.get_space_group_info()[0] if structure else None
+        self._data = data  # pylint: disable=protected-access
+        self.metadata = metadata if metadata else {}
+
+    @property
+    def rem(self):
+        return self._data.get("rem")
+
+    @property
+    def atoms(self):
+        """Returns a ``ase.atoms`` object"""
+        return AseAtomsAdaptor.get_atoms(self.structure)
+
+    @property
+    def data(self):
+        """Underlying data of the object"""
+        return self._data
+
+    @property
+    def label(self):
+        """Label of the structure"""
+        return self._data.get("label")
+
+    @property
+    def name(self):
+        """Alias for label"""
+        return self.label
+
+    @property
+    def enthalpy(self):
+        """Enthalpy as reported"""
+        return self._data.get("enthalpy")
+
+    @property
+    def volume(self):
+        """Volume as reported"""
+        return self._data.get("volume")
+
+    @property
+    def pressure(self):
+        """External pressure as reported"""
+        return self._data.get("pressure", 0.0)
+
+    @property
+    def natoms(self):
+        """Number of atoms"""
+        return self._data.get("natoms")
+
+    @property
+    def symm(self):
+        """Symmetry as reported"""
+        return self._data.get("symm")
+
+    @property
+    def spin(self):
+        """Spin as reported"""
+        return self._data.get("spin", 0.0)
+
+    @property
+    def spins(self):
+        """Spin as reported"""
+        return self._data.get("spins", [])
+
+    @property
+    def spin_abs(self):
+        """Absolute integrated spin"""
+        return self._data.get("spin_abs", 0.0)
+
+    @property
+    def composition(self):
+        """Composition of the structure"""
+        return self.structure.composition if self.structure else None
+
+    @classmethod
+    def from_string(cls, string):
+        """
+        Construct from a string.
+
+        Args:
+            string (str): Content of the SHELX file
+        """
+        return cls.from_lines(string.split("\n"))
+
+    @classmethod
+    def from_lines(cls, lines, include_structure=True, only_titl=False):
+        """
+        Construct from lines
+
+
+        Args:
+            lines (list of str): Content of the SHELX file
+            no_structure (bool, optional): Wether to parse the structure of not. Default to False.
+        """
+        if include_structure:
+            titls, rem_lines, structure, spins = read_res_pmg(lines)
+            data = {
+                "rem": rem_lines,
+                "spins": spins,
+                **titls._asdict(),
+            }
+
+        elif only_titl:
+            titls = read_titl(lines)
+            structure = None
+            data = titls._asdict()
+        else:
+            output = _read_res(lines)
+            data = {
+                "rem_line": output["rem_lines"],
+                "spins": output["spins"],
+                **output["titl"]._asdict(),
+            }
+            structure = None
+
+        obj = cls(structure, data, lines=lines)
+        return obj
+
+    def load_structure(self):
+        """Load structure from the lines"""
+        new_obj = self.from_lines(self.lines, include_structure=True)
+        self.structure = new_obj.structure
+        self._data = new_obj.data
+
+    @classmethod
+    def from_file(cls, fname, include_structure=True, only_titl=False):
+        """Construct from a file"""
+        with open(fname) as fhandle:
+            return cls.from_lines(fhandle.readlines(), include_structure=include_structure, only_titl=only_titl)
+
+    @classmethod
+    def from_packed(cls, fname, include_structure=True, only_titl=False):
+        """
+        Read data from a packed file.
+        A packed file is just a file with SHELX concatenated.
+        """
+        with tqdm() as pbar:
+            with open(fname) as stream:
+                lines = []
+                res_objs = []
+                for line in stream:
+                    if line.startswith("END"):
+                        res_objs.append(cls.from_lines(lines, include_structure=include_structure, only_titl=only_titl))
+                        lines = []
+                        pbar.update(1)
+                    else:
+                        lines.append(line)
+        return res_objs
+
+    def __repr__(self):
+        string = "<RESFile with label={}, formula={}, enthalpy={}...>"
+        return string.format(self.label, self.formula, self.enthalpy)
+
+    @property
+    def formula(self):
+        """Formula of the structure"""
+        if self.structure is not None:
+            return self.composition.formula.replace(" ", "")
+        return "Unkonwn"
+
+    @property
+    def reduced_formula(self):
+        """Reduced formula of the structure"""
+        if self.structure is not None:
+            return self.composition.reduced_formula
+        return "Unkonwn"
+
+    @property
+    def n_formula_units(self):
+        """Number of formula units"""
+        if self.structure is not None:
+            return self.composition.get_reduced_formula_and_factor()[1]
+        return "Unkonwn"
+
+    def to_computed_entry(self):
+        """Obtained the ComputedEntry"""
+        return ComputedStructureEntry(self.structure, self.enthalpy, data=self.data)
+
+    def to_res_lines(self):
+        """Get the raw RES representation of this object"""
+
+        species = [site.symbol for site in self.structure.species]
+        frac_pos = [row.tolist() for row in self.structure.frac_coords]
+        cellpar = self.structure.lattice.parameters
+
+        titl = [self.label, self.pressure, self.volume, self.enthalpy, self.spin, self.spin_abs, self.natoms, self.symm, "n", "-", "1"]
+
+        lines = _get_res_lines(titl, species, frac_pos, cellpar, self.rem, self.spins)
+        # Make sure we add an newline in the end
+        lines.append("")
+        return lines
+
+    def get_minsep(self, string=False):
+        """Return specie-wise minimum separations"""
+        minsep = get_minsep(self.structure.species, self.structure.distance_matrix)
+        if string:
+            return format_minsep(minsep)
+        return minsep
+
+
+
+def volume_calculator(
+    structure
+):
+    data = {"volume": structure.volume,
+            "natoms": len(structure),
+            "symm": structure.get_space_group_info()[0],
+           }
+    
+    res = RESFile(structure=structure, data=data)
+    formula_units = res.n_formula_units
+    tarvol = res.volume / formula_units if formula_units else None
+    
+    return {"volume":res.volume, 
+            "target_volume": tarvol,
+            "symmetry": res.symm,
+           }
+
+def gen_and_relax(
+    seed,
+    calculator,
+):
+
+    random_atoms = seed.build_random_atoms()
+    random_atoms.set_pbc(True)
+    random_atoms.calc = calculator
+
+    opt = BFGSLineSearch(FrechetCellFilter(random_atoms))
+    opt.run(fmax = 0.05,steps=500)
+
+    return random_atoms
+
+def grouping(relaxed_py):
+   
+    from pymatgen.analysis.structure_matcher import StructureMatcher
+    from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
+    
+    sm = StructureMatcher()
+    groups = sm.group_structures(relaxed_py)
+
+    grouped_data = []
+    for group in groups:
+
+        rep = group[0]
+        space_group = SpacegroupAnalyzer(rep).get_space_group_symbol()
+        
+        
+        energies = [structure.properties["energy"] for structure in group if "energy" in structure.properties]
+        
+        if energies:
+            group_energy = sum(energies) / len(energies)
+        else:
+            group_energy = None  # or float('nan')
+        
+        multiplicity = len(group)
+    
+        grouped_data.append({
+            "rep_structure" : rep,
+            "space_group": space_group,
+            "energy": group_energy,
+            "multiplicity": multiplicity
+        })
+    
+
+    grouped_data.sort(key=lambda d: float('inf') if d["energy"] is None else d["energy"])
+    return grouped_data
+
+def relaxation_analysis(
+    seed,
+    calculator,
+    num_iterations,
+):
+
+    relaxed_ase = []
+    relaxed_py = []
+    relaxed_properties = []
+    for iteration in tqdm(range(num_iterations)):
+        
+        try:
+            ase = gen_and_relax(seed, calculator)
+            if ase is None:
+                print("Gen and Relax returned None, Skipping")
+                continue
+        except Exception as e:
+            print("Gen and Relax returned Error, Skipping")
+            continue
+        
+        relaxed_ase.append(ase)
+
+        py = AseAtomsAdaptor.get_structure(ase)
+        py.properties["energy"] = ase.get_potential_energy() 
+        relaxed_py.append(py)
+        
+        volume_data = volume_calculator(py)
+
+        lat = py.lattice
+        a,b,c = lat.a, lat.b, lat.c
+        alpha, beta, gamma = lat.alpha, lat.beta, lat.gamma
+        
+        relaxed_properties.append({
+            "structure_id" : iteration,
+            "volume" : volume_data["volume"],
+            "target_volume" : volume_data["target_volume"],
+            "symmetry" : volume_data["symmetry"],
+            "energy" : ase.get_potential_energy(),
+            "fmax" : ase.get_forces().max(),
+            "atomic_positions" : py.frac_coords.tolist(),
+            "lattice_a"      : a,
+            "lattice_b"      : b,
+            "lattice_c"      : c,
+            "lattice_alpha"  : alpha,
+            "lattice_beta"   : beta,
+            "lattice_gamma"  : gamma,
+        })
+
+ 
+    relaxed_grouped = grouping(relaxed_py)
+
+    return relaxed_properties, relaxed_grouped, relaxed_ase
+
+
+def benchmark_calculator_structure(
+    calculator,
+    structure_1,
+    structure_2,
+    structure_3,
+    num_iterations,
+    symmops,
+    output_folder
+):
+    start_time = time.time()
+    structure1 = Structure.from_file(structure_1)
+    structure2 = Structure.from_file(structure_2)
+    structure3 = Structure.from_file(structure_3)
+
+    # Generate and relax
+    seed = define_seed(structure1, symmops=symmops)
+    relaxed_properties, relaxed_grouped, relaxed_ase = relaxation_analysis(
+        seed=seed,
+        calculator=calculator,
+        num_iterations=num_iterations
+    )
+
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    pd.DataFrame(relaxed_properties).to_csv(output_folder / "relaxed_properties.csv", index=False)
+    pd.DataFrame(relaxed_grouped).to_csv(output_folder / "relaxed_grouped.csv", index=False)
+
+    # Extract top-3 predicted structures
+    top3 = relaxed_grouped[:3]
+    pred_s1, pred_s2, pred_s3 = top3[0]["rep_structure"], top3[1]["rep_structure"], top3[2]["rep_structure"]
+
+    sm = StructureMatcher()
+
+    # Q1: any match to structure_1
+    Q1_match = any(sm.fit(structure1, group["rep_structure"]) for group in relaxed_grouped)
+
+    # Q2: any top-3 match to structure_1
+    Q2_match = any(sm.fit(structure1, s) for s in [pred_s1, pred_s2, pred_s3])
+
+    # Q3: top-1 match structure_1
+    Q3_match = sm.fit(structure1, pred_s1)
+
+    # Q4: all references appear in top-3 predictions (any order)
+    Q4_match = all(any(sm.fit(ref, s) for s in [pred_s1, pred_s2, pred_s3]) for ref in [structure1, structure2, structure3])
+
+    # Q5: reference ↔ prediction in exact order
+    Q5_match = all([
+        sm.fit(structure1, pred_s1),
+        sm.fit(structure2, pred_s2),
+        sm.fit(structure3, pred_s3)
+    ])
+
+    end_time = time.time()
+    time_taken = end_time - start_time
+
+    print(f"Q1: {Q1_match}, Q2: {Q2_match}, Q3: {Q3_match}, Q4: {Q4_match}, Q5: {Q5_match}")
+    print(f"Time Taken: {time_taken:.3f} seconds")
+
+    return {
+        "Q1": int(Q1_match),
+        "Q2": int(Q2_match),
+        "Q3": int(Q3_match),
+        "Q4": int(Q4_match),
+        "Q5": int(Q5_match),
+        "time_taken": time_taken,
+        "relaxed_grouped": relaxed_grouped
+    }
+    
+
+def calculate_statistics(all_results):
+    total_groups = len(all_results.get("relaxed_grouped", []))
+    Q1 = all_results.get("Q1", 0)
+    Q2 = all_results.get("Q2", 0)
+    Q3 = all_results.get("Q3", 0)
+    Q4 = all_results.get("Q4", 0)
+    Q5 = all_results.get("Q5", 0)
+
+    return {
+        "Q1_stats": Q1 / total_groups if total_groups else 0,
+        "Q2_stats": Q2 / total_groups if total_groups else 0,
+        "Q3_stats": Q3 / total_groups if total_groups else 0,
+        "Q4_stats": Q4 / total_groups if total_groups else 0,
+        "Q5_stats": Q5 / total_groups if total_groups else 0,
+    }
+
+    
+    
+from pathlib import Path
+
+def benchmark_calculator(
+    calculator,
+    calculator_name,
+    num_iterations=1000,
+    symmops="1-4",
+    classes=("elemental", "binary", "ternary"),
+    base_dir = Path(__file__).resolve().parent / "Benchmark"
+):
+    from pathlib import Path
+    import yaml
+    with open(base_dir / "data.yaml") as f:
+        benchmark_input = yaml.safe_load(f)
+
+    all_results = {}
+    all_stats = {}
+
+    for class_name in classes:
+        if class_name in benchmark_input:
+            for structure_name, structure_data in benchmark_input[class_name].items():
+                folder = base_dir / structure_data['folder']
+                structure_1 = folder / "1.cif"
+                structure_2 = folder / "2.cif"
+                structure_3 = folder / "3.cif"
+
+                print(f"Checking structure: {structure_name}, Path: {folder}")
+
+                output_folder = base_dir / calculator_name / structure_name
+                results = benchmark_calculator_structure(
+                    calculator=calculator,
+                    structure_1=structure_1,
+                    structure_2=structure_2,
+                    structure_3=structure_3,
+                    symmops=symmops,
+                    output_folder=output_folder,
+                    num_iterations=num_iterations,
+                )
+
+                all_results[structure_name] = results
+                all_stats[structure_name] = calculate_statistics(results)
+
+                output_folder.mkdir(parents=True, exist_ok=True)
+                try:
+                    pd.DataFrame.from_dict(all_stats, orient='index').to_csv(output_folder / "all_stats.csv", index=False)
+                except Exception as e:
+                    print(f"Error saving all_stats: {e}")
+
+                try:
+                    pd.DataFrame.from_dict(all_results, orient='index').to_csv(output_folder / "all_results.csv", index=False)
+                except Exception as e:
+                    print(f"Error saving all_results: {e}")
+
+    return all_results, all_stats
+
+
+
+def main():
+    calc = mace_mp(default_dtype="float64", device=device)
+    mace_1000_results,mace_1000_stats = benchmark_calculator(calc,"Mace",classes=["elemental", "binary", "ternary"]) 
+    print("Benchmarking complete.")
+
+
+
+if __name__ == "__main__":
+    main()
