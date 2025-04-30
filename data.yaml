@@ -36,10 +36,7 @@ binary:
     folder: structures/PbBr2
   MnO:
     folder: structures/MnO
-  ZnS:
-    folder: structures/ZnS
-  SnS:
-    folder: structures/SnS
+
 
 
 ternary:
