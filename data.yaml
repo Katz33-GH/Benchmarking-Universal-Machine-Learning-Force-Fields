@@ -1,0 +1,63 @@
+elemental:
+  Al:
+    folder: structures/Al
+  Zn:
+    folder: structures/Zn
+  Ni:
+    folder: structures/Ni
+  Mn:
+    folder: structures/Mn
+  Sn:
+    folder: structures/Sn
+  W:
+    folder: structures/W
+  U:
+    folder: structures/U
+  Hg:
+    folder: structures/Hg
+  Ga:
+    folder: structures/Ga
+
+
+binary:
+  NaCl:
+    folder: structures/NaCl
+  Al2O3:
+    folder: structures/Al2O3
+  Fe3O4:
+    folder: structures/Fe3O4
+  TiO2:
+    folder: structures/TiO2
+  Li2O:
+    folder: structures/Li2O
+  Pb3O4:
+    folder: structures/Pb3O4
+  PbBr2:
+    folder: structures/PbBr2
+  MnO:
+    folder: structures/MnO
+  ZnS:
+    folder: structures/ZnS
+  SnS:
+    folder: structures/SnS
+
+
+ternary:
+  BaAl2O4:
+    folder: structures/BaAl2O4
+  BaTiO3:
+    folder: structures/BaTiO3
+  CaCO3:
+    folder: structures/CaCO3
+  CaWO4:
+    folder: structures/CaWO4
+  CePO4:
+    folder: structures/CePO4
+  Fe2SiO4:
+    folder: structures/Fe2SiO4
+  MgAl2O4:
+    folder: structures/MgAl2O4
+  SrTiO3:
+    folder: structures/SrTiO3
+  TiFeO3:
+    folder: structures/TiFeO3
