@@ -38,6 +38,7 @@ with open(data_path) as f:
     benchmark_input = yaml.safe_load(f)
 
 def get_formula_str(structure):
+"""Return a species string with element counts in the format El%NUM=int."""
     structure = structure.remove_oxidation_states()
     composition = structure.composition.reduced_composition
     el_amt = composition.get_el_amt_dict()
@@ -52,6 +53,7 @@ def volume_calculator(structure):
     return {"volume": data["volume"], "target_volume": tarvol, "symmetry": data["symm"]}
 
 def define_seed(structure, symmops):
+"""Create a SeedAtoms object with symmetry and volume constraints."""
     species = get_formula_str(structure)
     targvol = volume_calculator(structure)["target_volume"]
     seed = SeedAtoms()
@@ -91,6 +93,7 @@ def grouping(structures):
     return sorted(result, key=lambda d: float('inf') if d["energy"] is None else d["energy"])
 
 def relaxation_analysis(seed, calculator, num_iterations):
+ """Generate and relax structures, returning relaxation results and properties."""
     relaxed_structures, ase_structures, properties = [], [], []
     for i in tqdm(range(num_iterations)):
         try:
@@ -117,6 +120,7 @@ def relaxation_analysis(seed, calculator, num_iterations):
     return properties, grouping(relaxed_structures), ase_structures
 
 def benchmark_calculator_structure(calculator, structure_1, structure_2, structure_3, num_iterations, symmops, output_folder):
+"""Run full benchmarking on one compound (3 references), compute Q1–Q5."""
     start = time.time()
     s1, s2, s3 = Structure.from_file(structure_1), Structure.from_file(structure_2), Structure.from_file(structure_3)
     seed = define_seed(s1, symmops=symmops)
@@ -142,6 +146,7 @@ def calculate_statistics(results):
     return {f"Q{i}_stats": results.get(f"Q{i}", 0) / total if total else 0 for i in range(1, 6)}
 
 def benchmark_calculator(calculator, calculator_name, num_iterations=1000, symmops="1-4", classes=("elemental", "binary", "ternary")):
+"""Iterate over all compounds and run benchmarking for each."""
     all_results, all_stats = {}, {}
     for class_name in classes:
         for name, data in benchmark_input.get(class_name, {}).items():
