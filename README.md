@@ -39,28 +39,36 @@ from pymatgen.symmetry.analyzer import SpacegroupAnalyzer
 # MACE: 
 
 from mace.calculators import mace_mp
+
 calc = mace_mp(default_dtype="float64", device=device)
 
 
 # GRACE-1L-OAM:
 
 from tensorpotential.calculator import TPCalculator
+
 calc = TPCalculator("/home/kzhong/.cache/grace/GRACE-1L-OAM_2Feb25")
 
 
 # SevenNet-0 
 
 from pymatgen.io.ase import AseAtomsAdaptor
+
 adaptor = AseAtomsAdaptor()
+
 from sevenn.calculator import SevenNetCalculator
+
 calc = SevenNetCalculator(model='7net-0', device=device)
 
 
 # MatterSim 
 
 from pymatgen.io.ase import AseAtomsAdaptor
+
 adaptor = AseAtomsAdaptor()
+
 from mattersim.forcefield import MatterSimCalculator
+
 calc=MatterSimCalculator(load_path="/home/kzhong/Benchmark/mattersim-v1.0.0-5M.pth", device=device)
 
 
